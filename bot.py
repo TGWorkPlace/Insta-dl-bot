@@ -1,6 +1,6 @@
 """
 Instagram Reel & Post Downloader Bot
---------------------------------------
+---------------------------------------
 • Accepts Instagram reel/post links from users
 • Identifies if the link is a REEL or a POST
   – Reel  → downloads video, extracts metadata (duration/thumb/dimensions)
