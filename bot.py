@@ -430,8 +430,8 @@ async def cmd_start(client: Client, msg: Message):
         "• Reels → sent as video with full metadata\n"
         "• Posts → all images sent as a photo album\n\n"
         "Example:\n"
-        "`https://www.instagram.com/reel/DY9khhtxvnu/`\n"
-        "`https://www.instagram.com/p/DYuExr6E7wu/`"
+        "`https://www.instagram.com/reel/AbcDefg/`\n"
+        "`https://www.instagram.com/p/AbcDefg/`"
     )
 
 
@@ -450,8 +450,8 @@ async def fsub_check_callback(client: Client, query: CallbackQuery):
                 "• Reels → sent as video with full metadata\n"
                 "• Posts → all images sent as a photo album\n\n"
                 "Example:\n"
-                "`https://www.instagram.com/reel/DY9khhtxvnu/`\n"
-                "`https://www.instagram.com/p/DYuExr6E7wu/`"
+                "`https://www.instagram.com/reel/AbcDefg/`\n"
+                "`https://www.instagram.com/p/AbcDefg/`"
             ),
         )
     else:
@@ -517,7 +517,7 @@ async def _handle_reel(client: Client, msg: Message, instagram_url: str) -> None
         return
 
     # 2. Download video
-    await status.edit_text("⬇️ Downloading reel…")
+    await status.edit_text("<b>⬇️ Downloading reel…</b>")
 
     tmp_video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
     tmp_video.close()
@@ -536,14 +536,14 @@ async def _handle_reel(client: Client, msg: Message, instagram_url: str) -> None
         return
 
     # 3. Extract metadata + thumbnail
-    await status.edit_text("🎞️ Processing video…")
+    await status.edit_text("<b>🎞️ Processing video…</b>")
 
     loop = asyncio.get_event_loop()
     width, height, duration = await loop.run_in_executor(None, extract_metadata, video_path)
     has_thumb = await loop.run_in_executor(None, extract_thumbnail, video_path, thumb_path, 1.0)
 
     # 4. Upload
-    await status.edit_text("📤 Uploading to Telegram…")
+    await status.edit_text("<b>📤 Uploading to Telegram…</b>")
 
     try:
         await msg.reply_video(
@@ -602,7 +602,7 @@ async def _handle_post(client: Client, msg: Message, instagram_url: str) -> None
         return
 
     # 2. Download all images
-    await status.edit_text(f"⬇️ Downloading {len(image_urls)} image(s)…")
+    await status.edit_text(f"<b>⬇️ Downloading {len(image_urls)} image(s)…</b>")
 
     image_paths: list[str] = []
     try:
@@ -619,7 +619,7 @@ async def _handle_post(client: Client, msg: Message, instagram_url: str) -> None
         return
 
     # 3. Upload as media group (or single photo)
-    await status.edit_text("📤 Uploading to Telegram…")
+    await status.edit_text("<b>📤 Uploading to Telegram…</b>")
 
     try:
         if len(image_paths) == 1:
