@@ -1,6 +1,6 @@
 """
 Instagram Reel & Post Downloader Bot
----------------------------------------
+--------------------------------------
 • Accepts Instagram reel/post links from users
 • Identifies if the link is a REEL or a POST
   – Reel  → downloads video, extracts metadata (duration/thumb/dimensions)
@@ -9,10 +9,12 @@ Instagram Reel & Post Downloader Bot
              sends as a media group (no metadata needed)
 • Force-subscription gate before any action
 • Logs every download to a log channel
+• Inline mode: user types @bot <url> → deep-link opens PM → auto-downloads
 • Lightweight HTTP server on port 8080 for Koyeb health-checks
 """
 
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -25,13 +27,14 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx
 from bs4 import BeautifulSoup
 from pyrogram import Client, filters
-from pyrogram.enums import ChatMemberStatus
+from pyrogram.enums import ChatMemberStatus, ParseMode
 from pyrogram.types import (
     Message,
     InlineKeyboardMarkup,
     InlineKeyboardButton,
     CallbackQuery,
     InputMediaPhoto,
+    InlineQuery,
 )
 from pyrogram.errors import UserNotParticipant
 
@@ -61,14 +64,12 @@ LOG_CHANNEL  = os.environ.get("LOG_CHANNEL")
 # Regex helpers
 # ─────────────────────────────────────────────
 
-# Matches any Instagram reel / post / tv URL
 INSTAGRAM_RE = re.compile(
     r"https?://(?:www\.)?instagram\.com/"
     r"(?:reel|p|tv)/([A-Za-z0-9_-]+)/?",
     re.IGNORECASE,
 )
 
-# A URL is a REEL if the path contains /reel/
 REEL_RE = re.compile(
     r"https?://(?:www\.)?instagram\.com/reel/",
     re.IGNORECASE,
@@ -110,23 +111,39 @@ def start_health_server():
 # Force-subscription helpers
 # ─────────────────────────────────────────────
 
-def _parse_channel(raw: str) -> int | str:
-    if raw is None:
+def _parse_channel(raw: str) -> int | str | None:
+    if not raw:
         return None
     raw = raw.strip()
+    if not raw:
+        return None
     try:
         return int(raw)
     except ValueError:
-        return raw.lstrip("@")
+        return raw.lstrip("@") or None
 
 
 _CHANNEL_ID = _parse_channel(AUTH_CHANNEL)
 _LOG_ID     = _parse_channel(LOG_CHANNEL)
 
+log.info("AUTH_CHANNEL resolved → %r", _CHANNEL_ID)
+log.info("LOG_CHANNEL  resolved → %r", _LOG_ID)
 
-async def is_subscribed(client: Client, user_id: int) -> bool:
+
+async def is_subscribed(client: Client, user_or_query) -> bool:
+    """
+    Works for both Message senders and InlineQuery senders.
+    Accepts a Pyrogram user object or anything with .from_user.
+    """
     if _CHANNEL_ID is None:
         return True
+    # Accept either a raw user_id int or an object with .from_user / .id
+    if isinstance(user_or_query, int):
+        user_id = user_or_query
+    elif hasattr(user_or_query, "from_user"):
+        user_id = user_or_query.from_user.id
+    else:
+        user_id = user_or_query.id
     try:
         member = await client.get_chat_member(_CHANNEL_ID, user_id)
         return member.status in (
@@ -161,7 +178,29 @@ async def send_fsub_prompt(msg: Message) -> None:
 
 
 # ─────────────────────────────────────────────
-# Log-channel helper
+# Deep-link decode  (used by inline flow)
+# ─────────────────────────────────────────────
+
+def _decode_start_param(param: str) -> str | None:
+    """
+    Decode a base64url-encoded Instagram URL passed as a /start parameter.
+    Returns the URL string, or None if decoding fails / result isn't Instagram.
+    """
+    try:
+        # Restore stripped padding
+        padding = 4 - len(param) % 4
+        if padding != 4:
+            param += "=" * padding
+        decoded = base64.urlsafe_b64decode(param).decode()
+        if INSTAGRAM_RE.search(decoded):
+            return decoded
+    except Exception:
+        pass
+    return None
+
+
+# ─────────────────────────────────────────────
+# Log-channel helpers
 # ─────────────────────────────────────────────
 
 async def log_reel_to_channel(
@@ -176,6 +215,11 @@ async def log_reel_to_channel(
     has_thumb: bool,
 ) -> None:
     if _LOG_ID is None:
+        log.warning("LOG_CHANNEL not set — skipping reel log")
+        return
+
+    if not os.path.exists(video_path):
+        log.error("log_reel_to_channel: video file missing at %s", video_path)
         return
 
     user_mention = f"[{user.first_name}](tg://user?id={user.id})"
@@ -190,15 +234,16 @@ async def log_reel_to_channel(
             chat_id=_LOG_ID,
             video=video_path,
             caption=caption,
+            parse_mode=ParseMode.MARKDOWN,
             supports_streaming=True,
-            thumb=thumb_path if has_thumb else None,
+            thumb=thumb_path if has_thumb and os.path.exists(thumb_path) else None,
             duration=duration or None,
             width=width or None,
             height=height or None,
         )
         log.info("Logged reel to log channel for user %d", user.id)
-    except Exception:
-        log.exception("Failed to send reel log to LOG_CHANNEL")
+    except Exception as e:
+        log.exception("Failed to send reel log to LOG_CHANNEL: %s", e)
 
 
 async def log_post_to_channel(
@@ -208,6 +253,12 @@ async def log_post_to_channel(
     user: object,
 ) -> None:
     if _LOG_ID is None:
+        log.warning("LOG_CHANNEL not set — skipping post log")
+        return
+
+    existing_paths = [p for p in image_paths if os.path.exists(p)]
+    if not existing_paths:
+        log.error("log_post_to_channel: all image files are missing, cannot log")
         return
 
     user_mention = f"[{user.first_name}](tg://user?id={user.id})"
@@ -218,24 +269,26 @@ async def log_post_to_channel(
     )
 
     try:
-        if len(image_paths) == 1:
+        if len(existing_paths) == 1:
             await client.send_photo(
                 chat_id=_LOG_ID,
-                photo=image_paths[0],
+                photo=existing_paths[0],
                 caption=main_caption,
+                parse_mode=ParseMode.MARKDOWN,
             )
         else:
             media_group = [
                 InputMediaPhoto(
                     media=p,
                     caption=main_caption if i == 0 else "",
+                    parse_mode=ParseMode.MARKDOWN if i == 0 else None,
                 )
-                for i, p in enumerate(image_paths)
+                for i, p in enumerate(existing_paths)
             ]
             await client.send_media_group(chat_id=_LOG_ID, media=media_group)
         log.info("Logged post to log channel for user %d", user.id)
-    except Exception:
-        log.exception("Failed to send post log to LOG_CHANNEL")
+    except Exception as e:
+        log.exception("Failed to send post log to LOG_CHANNEL: %s", e)
 
 
 # ─────────────────────────────────────────────
@@ -310,7 +363,6 @@ def _to_vx_url(instagram_url: str) -> str:
 
 
 async def _get_vx_soup(instagram_url: str) -> BeautifulSoup:
-    """Fetch the vxinstagram page and return a BeautifulSoup object."""
     vx_url = _to_vx_url(instagram_url)
     log.info("Fetching vxinstagram page: %s", vx_url)
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=20) as client:
@@ -319,20 +371,12 @@ async def _get_vx_soup(instagram_url: str) -> BeautifulSoup:
     return BeautifulSoup(resp.text, "html.parser")
 
 
-# ── Reel scraper ─────────────────────────────
-
 async def fetch_reel_download_link(instagram_url: str) -> str | None:
-    """
-    Scrape the direct .mp4 download URL for a reel from vxinstagram.
-    Looks for the first <a class='btn-success' download> or any .mp4 href.
-    """
     soup = await _get_vx_soup(instagram_url)
 
     btn = soup.find("a", class_="btn-success", attrs={"download": True})
     if btn and btn.get("href"):
         href = btn["href"]
-        # vxinstagram returns images for posts, videos for reels
-        # Accept any href from btn-success for reels
         log.info("Reel download URL found via btn-success: %s", href[:80])
         return href
 
@@ -345,18 +389,7 @@ async def fetch_reel_download_link(instagram_url: str) -> str | None:
     return None
 
 
-# ── Post scraper ─────────────────────────────
-
 async def fetch_post_image_urls(instagram_url: str) -> list[str]:
-    """
-    Scrape ALL image download URLs for a post from vxinstagram.
-
-    vxinstagram renders each image in its own card with:
-        <a class="btn-success" download href="...">Download</a>
-
-    We collect every unique href from those buttons.
-    For single-image posts there will be exactly one; for carousels, many.
-    """
     soup = await _get_vx_soup(instagram_url)
 
     urls: list[str] = []
@@ -386,7 +419,6 @@ async def fetch_post_image_urls(instagram_url: str) -> list[str]:
 # ─────────────────────────────────────────────
 
 async def download_file(url: str, dest: str) -> None:
-    """Stream any file (video or image) from url to dest."""
     log.info("Downloading → %s", dest)
     async with httpx.AsyncClient(headers=HEADERS, follow_redirects=True, timeout=120) as client:
         async with client.stream("GET", url) as resp:
@@ -416,6 +448,9 @@ app = Client(
     bot_token=BOT_TOKEN,
 )
 
+# Register inline handler from inline.py
+import inline  # noqa: E402  (imported after app is defined so it can use @Client.on_inline_query)
+
 
 # ── /start ───────────────────────────────────
 @app.on_message(filters.command("start"))
@@ -424,11 +459,33 @@ async def cmd_start(client: Client, msg: Message):
         await send_fsub_prompt(msg)
         return
 
+    # ── Deep-link from inline mode ──────────────────────────────────────────
+    # When a user taps the inline result button, Telegram sends:
+    #   /start <base64url-encoded-instagram-url>
+    # We decode it and immediately process the download.
+    parts = msg.text.split(maxsplit=1)
+    if len(parts) == 2:
+        param = parts[1].strip()
+        instagram_url = _decode_start_param(param)
+        if instagram_url:
+            log.info(
+                "Deep-link start from user %d → %s", msg.from_user.id, instagram_url
+            )
+            is_reel = bool(REEL_RE.search(instagram_url))
+            if is_reel:
+                await _handle_reel(client, msg, instagram_url)
+            else:
+                await _handle_post(client, msg, instagram_url)
+            return
+
+    # ── Normal /start (no param or unrecognised param) ──────────────────────
     await msg.reply_text(
         "👋 **Instagram Reel & Post Downloader**\n\n"
         "Send me any Instagram reel or post link!\n\n"
         "• Reels → sent as video with full metadata\n"
         "• Posts → all images sent as a photo album\n\n"
+        "You can also use me inline in any chat:\n"
+        "`@YourBotUsername <instagram_url>`\n\n"
         "Example:\n"
         "`https://www.instagram.com/reel/AbcDefg/`\n"
         "`https://www.instagram.com/p/AbcDefg/`"
@@ -449,9 +506,8 @@ async def fsub_check_callback(client: Client, query: CallbackQuery):
                 "Send me any Instagram reel or post link!\n\n"
                 "• Reels → sent as video with full metadata\n"
                 "• Posts → all images sent as a photo album\n\n"
-                "Example:\n"
-                "`https://www.instagram.com/reel/AbcDefg/`\n"
-                "`https://www.instagram.com/p/AbcDefg/`"
+                "You can also use me inline in any chat:\n"
+                "`@YourBotUsername <instagram_url>`"
             ),
         )
     else:
@@ -501,7 +557,6 @@ async def handle_message(client: Client, msg: Message):
 async def _handle_reel(client: Client, msg: Message, instagram_url: str) -> None:
     status = await msg.reply_text("🔍 Fetching reel download link…")
 
-    # 1. Scrape
     try:
         download_url = await fetch_reel_download_link(instagram_url)
     except Exception as exc:
@@ -516,7 +571,6 @@ async def _handle_reel(client: Client, msg: Message, instagram_url: str) -> None
         )
         return
 
-    # 2. Download video
     await status.edit_text("<b>⬇️ Downloading reel…</b>")
 
     tmp_video = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
@@ -535,14 +589,12 @@ async def _handle_reel(client: Client, msg: Message, instagram_url: str) -> None
         _cleanup(video_path, thumb_path)
         return
 
-    # 3. Extract metadata + thumbnail
     await status.edit_text("<b>🎞️ Processing video…</b>")
 
     loop = asyncio.get_event_loop()
     width, height, duration = await loop.run_in_executor(None, extract_metadata, video_path)
     has_thumb = await loop.run_in_executor(None, extract_thumbnail, video_path, thumb_path, 1.0)
 
-    # 4. Upload
     await status.edit_text("<b>📤 Uploading to Telegram…</b>")
 
     try:
@@ -559,10 +611,7 @@ async def _handle_reel(client: Client, msg: Message, instagram_url: str) -> None
     except Exception as exc:
         log.exception("Reel upload failed")
         await status.edit_text(f"❌ Upload failed.\n`{exc}`")
-        _cleanup(video_path, thumb_path)
-        return
 
-    # 5. Log
     await log_reel_to_channel(
         client=client,
         video_path=video_path,
@@ -585,7 +634,6 @@ async def _handle_reel(client: Client, msg: Message, instagram_url: str) -> None
 async def _handle_post(client: Client, msg: Message, instagram_url: str) -> None:
     status = await msg.reply_text("🔍 Fetching post images…")
 
-    # 1. Scrape all image URLs
     try:
         image_urls = await fetch_post_image_urls(instagram_url)
     except Exception as exc:
@@ -601,7 +649,6 @@ async def _handle_post(client: Client, msg: Message, instagram_url: str) -> None
         )
         return
 
-    # 2. Download all images
     await status.edit_text(f"<b>⬇️ Downloading {len(image_urls)} image(s)…</b>")
 
     image_paths: list[str] = []
@@ -618,7 +665,6 @@ async def _handle_post(client: Client, msg: Message, instagram_url: str) -> None
         _cleanup(*image_paths)
         return
 
-    # 3. Upload as media group (or single photo)
     await status.edit_text("<b>📤 Uploading to Telegram…</b>")
 
     try:
@@ -647,10 +693,7 @@ async def _handle_post(client: Client, msg: Message, instagram_url: str) -> None
     except Exception as exc:
         log.exception("Post upload failed")
         await status.edit_text(f"❌ Upload failed.\n`{exc}`")
-        _cleanup(*image_paths)
-        return
 
-    # 4. Log
     await log_post_to_channel(
         client=client,
         image_paths=image_paths,
