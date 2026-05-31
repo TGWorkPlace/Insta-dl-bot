@@ -27,7 +27,7 @@ from pyrogram.errors.exceptions.bad_request_400 import QueryIdInvalid
 # ── Re-use helpers already defined in your main bot module ──────────────────
 # Import the same regex patterns and subscription checker from your main file.
 # Adjust the import path if your project structure differs.
-from main import (
+from bot import (
     INSTAGRAM_RE,
     REEL_RE,
     is_subscribed,
