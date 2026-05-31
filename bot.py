@@ -211,27 +211,24 @@ async def log_post_to_channel(
         return
 
     user_mention = f"[{user.first_name}](tg://user?id={user.id})"
+    main_caption = (
+        f"🖼 **New Post Downloaded**\n\n"
+        f"👤 User: {user_mention} (`{user.id}`)\n"
+        f"🔗 Link: {instagram_url}"
+    )
 
     try:
         if len(image_paths) == 1:
             await client.send_photo(
                 chat_id=_LOG_ID,
                 photo=image_paths[0],
-                caption=(
-                    f"🖼 **New Post Downloaded**\n\n"
-                    f"👤 User: {user_mention} (`{user.id}`)\n"
-                    f"🔗 Link: {instagram_url}"
-                ),
+                caption=main_caption,
             )
         else:
             media_group = [
                 InputMediaPhoto(
                     media=p,
-                    caption=(
-                        f"🖼 **New Post Downloaded**\n\n"
-                        f"👤 User: {user_mention} (`{user.id}`)\n"
-                        f"🔗 Link: {instagram_url}"
-                    ) if i == 0 else "",
+                    caption=main_caption if i == 0 else "",
                 )
                 for i, p in enumerate(image_paths)
             ]
@@ -626,9 +623,11 @@ async def _handle_post(client: Client, msg: Message, instagram_url: str) -> None
 
     try:
         if len(image_paths) == 1:
-            await msg.reply_photo(
+            await client.send_photo(
+                chat_id=msg.chat.id,
                 photo=image_paths[0],
                 caption="✅ Here's your post!",
+                reply_to_message_id=msg.id,
             )
         else:
             media_group = [
@@ -638,7 +637,11 @@ async def _handle_post(client: Client, msg: Message, instagram_url: str) -> None
                 )
                 for i, p in enumerate(image_paths)
             ]
-            await msg.reply_media_group(media=media_group)
+            await client.send_media_group(
+                chat_id=msg.chat.id,
+                media=media_group,
+                reply_to_message_id=msg.id,
+            )
 
         await status.delete()
     except Exception as exc:
