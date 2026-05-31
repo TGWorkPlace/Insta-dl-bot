@@ -25,7 +25,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import httpx
 from bs4 import BeautifulSoup
 from pyrogram import Client, filters
-from pyrogram.enums import ChatMemberStatus
+from pyrogram.enums import ChatMemberStatus, ParseMode
 from pyrogram.types import (
     Message,
     InlineKeyboardMarkup,
@@ -110,18 +110,31 @@ def start_health_server():
 # Force-subscription helpers
 # ─────────────────────────────────────────────
 
-def _parse_channel(raw: str) -> int | str:
-    if raw is None:
+def _parse_channel(raw: str) -> int | str | None:
+    """
+    Parse a channel identifier from an env-var string.
+    Accepts:
+      • Numeric IDs  e.g. "-1001234567890"  → int
+      • Usernames    e.g. "@mychannel"       → str (without @)
+    Returns None when raw is None or empty.
+    """
+    if not raw:
         return None
     raw = raw.strip()
+    if not raw:
+        return None
     try:
         return int(raw)
     except ValueError:
-        return raw.lstrip("@")
+        return raw.lstrip("@") or None
 
 
 _CHANNEL_ID = _parse_channel(AUTH_CHANNEL)
 _LOG_ID     = _parse_channel(LOG_CHANNEL)
+
+# Log resolved IDs at startup so misconfiguration is immediately visible
+log.info("AUTH_CHANNEL resolved → %r", _CHANNEL_ID)
+log.info("LOG_CHANNEL  resolved → %r", _LOG_ID)
 
 
 async def is_subscribed(client: Client, user_id: int) -> bool:
@@ -176,6 +189,12 @@ async def log_reel_to_channel(
     has_thumb: bool,
 ) -> None:
     if _LOG_ID is None:
+        log.warning("LOG_CHANNEL not set — skipping reel log")
+        return
+
+    # Verify the file still exists before attempting upload
+    if not os.path.exists(video_path):
+        log.error("log_reel_to_channel: video file missing at %s", video_path)
         return
 
     user_mention = f"[{user.first_name}](tg://user?id={user.id})"
@@ -190,15 +209,16 @@ async def log_reel_to_channel(
             chat_id=_LOG_ID,
             video=video_path,
             caption=caption,
+            parse_mode=ParseMode.MARKDOWN,   # FIX: was missing — markdown in caption needs this
             supports_streaming=True,
-            thumb=thumb_path if has_thumb else None,
+            thumb=thumb_path if has_thumb and os.path.exists(thumb_path) else None,
             duration=duration or None,
             width=width or None,
             height=height or None,
         )
         log.info("Logged reel to log channel for user %d", user.id)
-    except Exception:
-        log.exception("Failed to send reel log to LOG_CHANNEL")
+    except Exception as e:
+        log.exception("Failed to send reel log to LOG_CHANNEL: %s", e)
 
 
 async def log_post_to_channel(
@@ -208,6 +228,13 @@ async def log_post_to_channel(
     user: object,
 ) -> None:
     if _LOG_ID is None:
+        log.warning("LOG_CHANNEL not set — skipping post log")
+        return
+
+    # Filter to only files that actually exist
+    existing_paths = [p for p in image_paths if os.path.exists(p)]
+    if not existing_paths:
+        log.error("log_post_to_channel: all image files are missing, cannot log")
         return
 
     user_mention = f"[{user.first_name}](tg://user?id={user.id})"
@@ -218,24 +245,26 @@ async def log_post_to_channel(
     )
 
     try:
-        if len(image_paths) == 1:
+        if len(existing_paths) == 1:
             await client.send_photo(
                 chat_id=_LOG_ID,
-                photo=image_paths[0],
+                photo=existing_paths[0],
                 caption=main_caption,
+                parse_mode=ParseMode.MARKDOWN,   # FIX: was missing
             )
         else:
             media_group = [
                 InputMediaPhoto(
                     media=p,
                     caption=main_caption if i == 0 else "",
+                    parse_mode=ParseMode.MARKDOWN if i == 0 else None,   # FIX: was missing
                 )
-                for i, p in enumerate(image_paths)
+                for i, p in enumerate(existing_paths)
             ]
             await client.send_media_group(chat_id=_LOG_ID, media=media_group)
         log.info("Logged post to log channel for user %d", user.id)
-    except Exception:
-        log.exception("Failed to send post log to LOG_CHANNEL")
+    except Exception as e:
+        log.exception("Failed to send post log to LOG_CHANNEL: %s", e)
 
 
 # ─────────────────────────────────────────────
@@ -331,8 +360,6 @@ async def fetch_reel_download_link(instagram_url: str) -> str | None:
     btn = soup.find("a", class_="btn-success", attrs={"download": True})
     if btn and btn.get("href"):
         href = btn["href"]
-        # vxinstagram returns images for posts, videos for reels
-        # Accept any href from btn-success for reels
         log.info("Reel download URL found via btn-success: %s", href[:80])
         return href
 
@@ -350,12 +377,6 @@ async def fetch_reel_download_link(instagram_url: str) -> str | None:
 async def fetch_post_image_urls(instagram_url: str) -> list[str]:
     """
     Scrape ALL image download URLs for a post from vxinstagram.
-
-    vxinstagram renders each image in its own card with:
-        <a class="btn-success" download href="...">Download</a>
-
-    We collect every unique href from those buttons.
-    For single-image posts there will be exactly one; for carousels, many.
     """
     soup = await _get_vx_soup(instagram_url)
 
@@ -542,9 +563,10 @@ async def _handle_reel(client: Client, msg: Message, instagram_url: str) -> None
     width, height, duration = await loop.run_in_executor(None, extract_metadata, video_path)
     has_thumb = await loop.run_in_executor(None, extract_thumbnail, video_path, thumb_path, 1.0)
 
-    # 4. Upload
+    # 4. Upload to user
     await status.edit_text("<b>📤 Uploading to Telegram…</b>")
 
+    upload_ok = False
     try:
         await msg.reply_video(
             video=video_path,
@@ -556,13 +578,13 @@ async def _handle_reel(client: Client, msg: Message, instagram_url: str) -> None
             height=height or None,
         )
         await status.delete()
+        upload_ok = True
     except Exception as exc:
         log.exception("Reel upload failed")
         await status.edit_text(f"❌ Upload failed.\n`{exc}`")
-        _cleanup(video_path, thumb_path)
-        return
 
-    # 5. Log
+    # FIX: Always attempt to log regardless of upload result,
+    #      and only cleanup AFTER logging is done.
     await log_reel_to_channel(
         client=client,
         video_path=video_path,
@@ -647,10 +669,9 @@ async def _handle_post(client: Client, msg: Message, instagram_url: str) -> None
     except Exception as exc:
         log.exception("Post upload failed")
         await status.edit_text(f"❌ Upload failed.\n`{exc}`")
-        _cleanup(*image_paths)
-        return
+        # FIX: Don't return here — still attempt to log and cleanup below
 
-    # 4. Log
+    # FIX: Log BEFORE cleanup so files still exist on disk
     await log_post_to_channel(
         client=client,
         image_paths=image_paths,
